@@ -13,6 +13,57 @@ reconstruct from git archaeology.
 
 ### Fixed
 
+- **Vulnerability preflight distinguishes tool failures from findings** --
+  @arin30. Preflight reuses only the pinned `govulncheck` version, reports a
+  missing or unusable scanner as a non-green `SKIP`, and keeps actual
+  vulnerability findings as failures. Empty or unparseable scanner output is
+  treated as unavailable; the earlier build stage remains responsible for
+  reporting source compilation failures.
+
+### Changed
+
+- **Versioned schema migrations** -- @hc12r. The database now records the
+  migrations applied to it, in a new `schema_migrations` table, and a start
+  applies only the ones it lacks. Until now the whole schema setup ran on
+  every start, with most of its errors ignored. The first start after
+  upgrading runs that setup one last time, as migration 1, and logs
+  `applied schema migration 1 (baseline)`; later starts skip it. An older
+  release still starts against an upgraded database, so a rollback works.
+  The system roles and the built-in templates are still brought up to date
+  on every start.
+
+## [0.20.0] - 2026-10-25
+
+A reliability release. A node's timeout now stops the work it times out:
+before, Brokoli stopped waiting but the step carried on, and a retry could
+write the same rows a second time. Alongside that, fixes for crashes,
+races and quietly wrong answers found in an audit of the codebase.
+
+### Changed
+
+These can change what an existing deployment does.
+
+- **Upgrading from 0.19** -- @hc12r. No new migration runs. Node
+  timeouts are now enforced: a step that times out is cancelled, and a
+  timed-out attempt that does not stop within the node's timeout (at most
+  30 seconds) fails the node instead of being retried beside it, so a
+  step that used to finish past its timeout now fails at it. Cancelled
+  runs move from `brokoli_pipeline_runs_failed` to the new
+  `brokoli_pipeline_runs_cancelled`. Integers from REST sources, JSON
+  files and code nodes are `int64` rather than `float64`. Dedup keeps rows
+  it used to drop as duplicates, and joins match an integer key with the
+  same number as a float. Session tokens are accepted only when signed
+  with HS256. A server whose scheduler cannot start exits. Each is
+  described below.
+- **A server whose scheduler cannot start exits** -- @hc12r. In `all`
+  and `scheduler` mode, a scheduler that failed to start (its first read
+  of the pipelines failed) was logged as a warning, and the process went
+  on serving with no scheduler: nothing ran on a schedule, and only that
+  log line said so. The process now exits with the error, so a process
+  supervisor or orchestrator restarts it.
+
+### Fixed
+
 - **Starting a Postgres installation no longer rebuilds the variables
   key** -- @hc12r. Every start dropped the `variables` primary key and
   added it again, as two statements with their errors ignored. While one
@@ -57,6 +108,111 @@ reconstruct from git archaeology.
   already did once data crossed a node boundary; a number with a
   fraction or exponent is still a float64. Code that embeds Brokoli and
   type-asserts these values sees `int64` where it saw `float64`.
+- **Dedup, join and count_distinct compare values, not their
+  printouts** -- @hc12r. Dedup keyed rows by printing each value, so
+  rows that were not duplicates were dropped: the number 1 and the text
+  "1" print the same, a missing value printed like the text "<nil>",
+  and a NUL inside one value could line two rows up. A join, the other
+  way round, never matched an integer id from a database with the same
+  id read as a float elsewhere, and count_distinct counted 1 and 1.0
+  twice. All three now compare values: numbers by value whatever type
+  carries them, text only with text, and a missing value only with a
+  missing value.
+- **Concurrent first requests no longer race on the session-token
+  secret** -- @hc12r. The secret that signs session tokens was loaded on
+  first use with no lock. Requests arriving together raced on it, and
+  with no `BROKOLI_JWT_SECRET` and no secret file each could generate
+  its own, so a token signed under one failed to verify under another.
+  Starting the server again in the same process could also replace it
+  and invalidate tokens already issued. It is now loaded once and kept,
+  and a token is accepted only when signed with HS256.
+- **Reading `/metrics` during runs is no longer a data race** -- @hc12r.
+  The engine counts runs, attempts and events with atomic updates, and
+  the metrics endpoint read the same fields plainly. It now reads them
+  through `Engine.Metrics()`, a snapshot taken atomically, which code
+  embedding Brokoli should use too.
+- **Scheduled, resumed and woken runs can stage task data** -- @hc12r.
+  Each way a run starts built its runner separately and copied the
+  engine's settings by hand, and the copies drifted. Only runs started
+  through the API or by a worker could issue the data capabilities a
+  remote task node needs for inputs over the inline row cap or for
+  stored outputs. Scheduled, backfill, webhook and trigger runs,
+  resumes, and runs woken from a wait were refused with "this server
+  issues no data capabilities". A woken run also ignored the engine's
+  native-driver and wait-in-place settings. Every run now gets its
+  runner from one place.
+- **A list that fails partway through says so instead of coming back
+  short** -- @hc12r. Twenty-two store functions (connections,
+  variables, workspaces and their members, API tokens, the run calendar,
+  the dead-letter queue, physical instances) read rows until the driver
+  stopped and never asked why, so an error mid-list returned a shorter
+  list as if it were complete. They now return the error.
+- **A panic inside a store transaction no longer leaves it open** --
+  @hc12r. `WithTx` rolled back only when its function returned an error.
+  A panic left the transaction open, and on SQLite every later write
+  then failed with "database is locked".
+- **A server whose scheduler failed to start shuts down instead of
+  hanging** -- @hc12r. When the scheduler could not start (its first
+  read of the pipelines failed), the server logged a warning and carried
+  on. At shutdown, stopping the scheduler then waited for loops that
+  had never started, so the process hung until it was killed. Stopping
+  a scheduler twice also panicked. Both now return.
+- **Rate limiters no longer leak a goroutine each** -- @hc12r. Every
+  rate limiter started a cleanup goroutine that never stopped. A server
+  builds four, so code that builds servers repeatedly (tests, an
+  embedding application) leaked four per server. Idle clients are now
+  forgotten while requests are handled, with no goroutine.
+- **A cancelled run is no longer counted as a failure** -- @hc12r. A
+  cancelled run ended with the same error as a failed one, so the engine
+  added it to `brokoli_pipeline_runs_failed`, and cancelling runs raised
+  the metric operators alert on. Cancelled runs are now counted in a new
+  `brokoli_pipeline_runs_cancelled` (`RunsCancelled`, also in
+  `Engine.Metrics()`), and the error they return is `engine.ErrRunCancelled`,
+  with the same message as before.
+- **A retry no longer runs alongside the attempt that timed out** --
+  @hc12r. When a node timed out, Brokoli stopped waiting for it but did
+  not stop it: a handler that does not watch its deadline kept running,
+  and the retry started beside it, so a sink or migrate could write
+  twice. A retry now waits for the timed-out attempt to stop, for up to
+  the node's timeout (at most 30 seconds). An attempt still running after
+  that fails the node instead of being retried beside it, with an error
+  that says so.
+- **A sink_db write stops when its attempt times out** -- @hc12r. A
+  database sink wrote under a context of its own, so a node's timeout
+  never reached the database: a write blocked on a lock carried on after
+  its attempt had timed out, and the retry wrote the same rows again
+  (6 rows for 3 on Postgres and on SQLite, with the run reported as
+  successful). The write now runs under the attempt's deadline and is
+  cancelled with it. `engine.ExecuteSQLContext` is the context-aware form
+  of `ExecuteSQL`.
+- **A migrate stops when its attempt times out** -- @hc12r. Same flaw
+  as the database sink: migrate read and wrote under the run's context,
+  which a node's timeout never reaches, so a write blocked on a lock
+  outlived its attempt and the retry migrated the rows again (6 rows for
+  3 on Postgres). Reads and writes now run under the attempt's deadline,
+  on every migrate path including partitions and remote workers.
+  `engine.QueryDatabaseContext` is the context-aware form of
+  `QueryDatabase`.
+- **An API sink stops sending when its attempt times out** -- @hc12r.
+  `sink_api` sent its batches under the run's context, which a node's
+  timeout never reaches, so after the node had timed out and failed it
+  went on sending the remaining batches for as long as the run lasted.
+  It now sends under the attempt's deadline. A request already received
+  by the endpoint cannot be taken back; no further batches go out.
+- **A notify node gives up when its attempt times out** -- @hc12r. It
+  posted with no context and only a 10-second client limit, so a slow
+  endpoint held the attempt past the node's timeout. The request now
+  carries the attempt's deadline.
+- **Database and API sources, dbt and code expansions stop with their
+  attempt** -- @hc12r. These steps ran under contexts their node's
+  deadline never reached. A `source_db` query whose attempt had timed out
+  went on waiting in the database. A `source_api` request ran to the
+  API's reply, and a paginated fetch could go on to further pages and sat
+  through every retry wait. A timed-out `dbt run` kept building models.
+  A code expansion's local instances ignored even cancelling the run.
+  Each now stops when its attempt times out or is cancelled.
+  `fetchers.ContextFetcher` and `RESTFetcher.FetchContext` bound a fetch
+  by a context.
 
 ## [0.19.0] - 2026-10-24
 

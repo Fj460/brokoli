@@ -472,7 +472,7 @@ func (r *Runner) Execute() (run *models.Run, err error) {
 
 		// Check if cancelled
 		if r.ctx.Err() != nil {
-			runErr = fmt.Errorf("pipeline cancelled")
+			runErr = ErrRunCancelled
 			break
 		}
 
@@ -565,7 +565,7 @@ func (r *Runner) Execute() (run *models.Run, err error) {
 
 				// Check cancellation before starting node
 				if r.ctx.Err() != nil {
-					nodeErr = fmt.Errorf("pipeline cancelled")
+					nodeErr = ErrRunCancelled
 					return
 				}
 
@@ -1207,6 +1207,7 @@ func (r *Runner) executeNode(node models.Node, outputs *nodeOutputs, edgeStates 
 		}()
 
 		var err error
+		stillRunning := false
 		select {
 		case result := <-resultCh:
 			output, outputRef, conditionDecision, err = result.result.output, result.result.outputRef, result.result.condition, result.err
@@ -1232,9 +1233,21 @@ func (r *Runner) executeNode(node models.Node, outputs *nodeOutputs, edgeStates 
 			}
 		case <-attemptCtx.Done():
 			if r.ctx.Err() != nil {
-				err = fmt.Errorf("pipeline cancelled")
+				err = ErrRunCancelled
 			} else {
 				err = fmt.Errorf("node timed out after %s", nodeTimeout)
+				// A timed-out attempt is abandoned, not stopped: a handler
+				// that does not watch attemptCtx keeps running. Retrying
+				// beside it could write twice (a sink, a migrate), so the
+				// retry waits for it to stop, and if it does not stop
+				// within the grace period the node fails here instead.
+				grace := min(nodeTimeout, maxAttemptStopGrace)
+				select {
+				case <-resultCh:
+				case <-time.After(grace):
+					stillRunning = true
+					err = fmt.Errorf("node timed out after %s and was still running %s later, so it was not retried: a retry alongside it could write twice", nodeTimeout, grace)
+				}
 			}
 		}
 		attemptCancel()
@@ -1581,6 +1594,9 @@ func (r *Runner) executeNode(node models.Node, outputs *nodeOutputs, edgeStates 
 		r.logWithTrace(node.ID, models.LogLevelWarning, spanID, attempt,
 			map[string]string{"error": err.Error(), "duration_ms": fmt.Sprintf("%d", duration)},
 			"Attempt %d/%d failed: %v", attempt+1, maxRetries+1, err)
+		if stillRunning {
+			break
+		}
 	}
 
 	if lastErr != nil {
@@ -1865,6 +1881,11 @@ func externalExecutorMustReturnData(n models.Node) bool {
 // its own remote dispatch (ADR-033) rather than claiming a second,
 // competing one at the same key: a task node's one instance IS the
 // whole node, unlike an expansion item's own distinct "idx:N" key.
+// maxAttemptStopGrace caps how long a timed-out attempt is given to
+// stop before its node fails without a retry. The grace is the node's
+// own timeout, up to this.
+const maxAttemptStopGrace = 30 * time.Second
+
 func (r *Runner) runNodeLogic(node models.Node, input *common.DataSet, inputSchema columnSchema, allInputs []*common.DataSet, allInputSchemas []columnSchema, edgeInputsByFrom map[string]*common.DataSet, attempt int, idempotencyKey string, ctx context.Context, execFencingGen int64) (nodeExecutionResult, error) {
 	// A disabled node type is refused here as well as at validation: this
 	// runs on the worker, whose operator may disable what the server that
@@ -1969,11 +1990,11 @@ func (r *Runner) runNodeLogic(node models.Node, input *common.DataSet, inputSche
 	case models.NodeTypeSourceFile:
 		return outputExecutionResult(r.runSourceFile(ctx, node))
 	case models.NodeTypeSourceAPI:
-		return outputExecutionResult(r.runSourceAPI(node))
+		return outputExecutionResult(r.runSourceAPI(ctx, node))
 	case models.NodeTypeSourceDB:
 		// Returns a full result: a source that can report its column
 		// types hands them downstream alongside the rows (#363).
-		return r.runSourceDB(node, attempt)
+		return r.runSourceDB(ctx, node, attempt)
 	case models.NodeTypeTransform:
 		return r.runTransform(node, input, inputSchema)
 	case models.NodeTypeProject:
@@ -1993,7 +2014,7 @@ func (r *Runner) runNodeLogic(node models.Node, input *common.DataSet, inputSche
 		// see engine/expansion.go's top-of-file doc comment for the full
 		// architectural resolution.
 		if nodeHasExpansion(node) {
-			output, err := r.runCodeExpansion(node, edgeInputsByFrom, attempt)
+			output, err := r.runCodeExpansion(ctx, node, edgeInputsByFrom, attempt)
 			if err != nil {
 				return nodeExecutionResult{}, err
 			}
@@ -2023,17 +2044,17 @@ func (r *Runner) runNodeLogic(node models.Node, input *common.DataSet, inputSche
 	case models.NodeTypeSinkFile:
 		return outputExecutionResult(r.runSinkFile(ctx, node, input))
 	case models.NodeTypeSinkDB:
-		return outputExecutionResult(r.runSinkDB(node, input, inputSchema, attempt))
+		return outputExecutionResult(r.runSinkDB(ctx, node, input, inputSchema, attempt))
 	case models.NodeTypeSinkAPI:
-		return outputExecutionResult(r.runSinkAPI(node, input))
+		return outputExecutionResult(r.runSinkAPI(ctx, node, input))
 	case models.NodeTypeMigrate:
-		return outputExecutionResult(r.runMigrate(node, attempt))
+		return outputExecutionResult(r.runMigrate(ctx, node, attempt))
 	case models.NodeTypeDBT:
 		// dbt can hand downstream a reference rather than rows (#353
 		// Phase 3), so it returns a full result rather than a dataset.
-		return r.runDBT(node)
+		return r.runDBT(ctx, node)
 	case models.NodeTypeNotify:
-		return outputExecutionResult(r.runNotify(node, input))
+		return outputExecutionResult(r.runNotify(ctx, node, input))
 	case models.NodeTypeBash:
 		return outputExecutionResult(r.runBash(ctx, node, input))
 	case models.NodeTypeWait:
@@ -2149,7 +2170,7 @@ func (r *Runner) finalizeCancelled() error {
 	r.fireHook("on_failure", map[string]string{"error": "cancelled by user"})
 	common.SLog().Info("run finished", common.RunAttr(r.run.ID), common.PipelineAttr(r.pipe.ID),
 		"status", models.RunStatusCancelled)
-	return fmt.Errorf("pipeline cancelled")
+	return ErrRunCancelled
 }
 
 func (r *Runner) failRun(err error) error {
