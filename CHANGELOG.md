@@ -11,6 +11,15 @@ reconstruct from git archaeology.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vulnerability preflight distinguishes tool failures from findings** --
+  @arin30. Preflight reuses only the pinned `govulncheck` version, reports a
+  missing or unusable scanner as a non-green `SKIP`, and keeps actual
+  vulnerability findings as failures. Empty or unparseable scanner output is
+  treated as unavailable; the earlier build stage remains responsible for
+  reporting source compilation failures.
+
 ### Changed
 
 - **Versioned schema migrations** -- @hc12r. The database now records the
