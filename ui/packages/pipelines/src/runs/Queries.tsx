@@ -9,7 +9,7 @@ import { highlightSql } from './sqlHighlight'
  * The exact SQL each node ran, grouped by node and attempt. Sourced from the run
  * events endpoint (`attempt.query` events) — no separate call. The recorder
  * records author-written SQL only (brokoli#665, #669), so the panel shows every
- * statement it receives, on whatever node ran it; shaping lives in ./queries.
+ * statement it receives, on whatever node ran it; shaping lives in ./runQueries.
  */
 export function Queries({ events, nodeNames }: { events: RunEvent[]; nodeNames: Record<string, string> }) {
   const groups = useMemo(() => groupQueries(events), [events])

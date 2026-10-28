@@ -6269,6 +6269,12 @@ Full curated notes with per-change ownership:
   event visible to any org was visible to every other org. Single-tenant /
   community-mode deployments were never affected.
 
+### Fixed
+
+- **The UI builds on macOS and Windows** -- @Fj460. Two logic files had the
+  same name as a component apart from case (`queries.ts` and `Queries.tsx`,
+  `heatmap.ts` and `Heatmap.tsx`), so on a case-insensitive filesystem the
+  component's import resolved to the wrong file and `npm run build` failed.
 ---
 
 ## Prior history
